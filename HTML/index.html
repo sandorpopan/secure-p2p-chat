@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Automated E2EE P2P Chat</title>
+    <style>
+        body { font-family: system-ui, sans-serif; max-width: 800px; margin: 30px auto; padding: 0 20px; color: #333; }
+        .grid { display: grid; grid-template-columns: 200px 1fr; gap: 20px; }
+        .panel { border: 1px solid #ddd; padding: 15px; border-radius: 8px; background: #fafafa; }
+        .user-item { padding: 8px; margin: 5px 0; background: #fff; border: 1px solid #eee; border-radius: 4px; cursor: pointer; }
+        .user-item:hover { background: #f0f0f0; }
+        #chat-log { height: 300px; border: 1px solid #ccc; border-radius: 4px; overflow-y: scroll; padding: 10px; background: #fff; margin-bottom: 10px; }
+        input, button { padding: 8px; margin: 4px 0; border-radius: 4px; border: 1px solid #ccc; }
+        input[type="text"] { width: calc(100% - 18px); }
+    </style>
+</head>
+<body>
+
+    <h2>Secure P2P Chat System</h2>
+    
+    <div style="margin-bottom: 15px;">
+        <label><strong>Shared Cryptographic Secret:</strong></label>
+        <input type="text" id="crypto-secret" value="DefaultSecurePassword123!" style="width: 300px;">
+    </div>
+
+    <div class="grid">
+        <!-- Sidebar -->
+        <div class="panel">
+            <h3>Online Users</h3>
+            <input type="text" id="username-input" placeholder="Your username...">
+            <button id="btn-connect" style="width: 100%;">Join Network</button>
+            <div id="users-list" style="margin-top: 15px;"></div>
+        </div>
+
+        <!-- Chat Main Area -->
+        <div class="panel">
+            <h3>Chat Window <span id="chat-target" style="color: #666; font-size: 0.9em;">(Select a user)</span></h3>
+            <div id="chat-log">Enter username and join to start.</div>
+            <input type="text" id="msg-input" placeholder="Type an encrypted message..." disabled>
+            <button id="btn-send" disabled>Send</button>
+        </div>
+    </div>
+
+    <script>
+        let wsServer;
+        let localPeerConnection;
+        let dataChannel;
+        let myUsername = "";
+        let targetUsername = "";
+
+        const log = (msg) => {
+            const logBox = document.getElementById('chat-log');
+            logBox.innerHTML += `<div>${msg}</div>`;
+            logBox.scrollTop = logBox.scrollHeight;
+        };
+
+        // --- CRYPTO UTILITIES ---
+        async function deriveAESKey(password) {
+            const enc = new TextEncoder();
+            const keyMaterial = await crypto.subtle.importKey("raw", enc.encode(password), { name: "PBKDF2" }, false, ["deriveKey"]);
+            return crypto.subtle.deriveKey(
+                { name: "PBKDF2", salt: enc.encode("P2PSaltText"), iterations: 100000, hash: "SHA-256" },
+                keyMaterial, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]
+            );
+        }
+
+        async function encrypt(text) {
+            const key = await deriveAESKey(document.getElementById('crypto-secret').value);
+            const iv = crypto.getRandomValues(new Uint8Array(12));
+            const cipher = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv }, key, new TextEncoder().encode(text));
+            const payload = new Uint8Array(iv.byteLength + cipher.byteLength);
+            payload.set(iv, 0); payload.set(new Uint8Array(cipher), iv.byteLength);
+            return payload;
+        }
+
+        async function decrypt(buffer) {
+            const key = await deriveAESKey(document.getElementById('crypto-secret').value);
+            const payload = new Uint8Array(buffer);
+            const iv = payload.slice(0, 12);
+            const cipher = payload.slice(12);
+            const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, key, cipher);
+            return new TextDecoder().decode(plain);
+        }
+
+        // --- SIGNALING & P2P CONNECTION ---
+        document.getElementById('btn-connect').addEventListener('click', () => {
+            myUsername = document.getElementById('username-input').value.trim();
+            if (!myUsername) return alert("Enter a username");
+
+            wsServer = new WebSocket('ws://localhost:8080');
+
+            wsServer.onopen = () => {
+                wsServer.send(JSON.stringify({ type: 'register', username: myUsername }));
+                document.getElementById('chat-log').innerHTML = "<div>Connected to server. Select a user to start P2P tunnel.</div>";
+            };
+
+            wsServer.onmessage = async (event) => {
+                const data = JSON.parse(event.data);
+
+                if (data.type === 'user-list') {
+                    const listDiv = document.getElementById('users-list');
+                    listDiv.innerHTML = "";
+                    data.users.forEach(user => {
+                        if (user !== myUsername) {
+                            const div = document.createElement('div');
+                            div.className = 'user-item';
+                            div.innerText = user;
+                            div.onclick = () => initiateP2PConnection(user);
+                            listDiv.appendChild(div);
+                        }
+                    });
+                } else if (data.type === 'relay') {
+                    handleSignalingPayload(data.sender, data.payload);
+                }
+            };
+        };
+
+        function initPeerObject(target) {
+            targetUsername = target;
+            document.getElementById('chat-target').innerText = `-> Chatting with ${target}`;
+            
+            localPeerConnection = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+
+            localPeerConnection.onicecandidate = (e) => {
+                if (e.candidate) {
+                    wsServer.send(JSON.stringify({ type: 'relay', target: targetUsername, payload: { candidate: e.candidate } }));
+                }
+            };
+
+            localPeerConnection.ondatachannel = (e) => {
+                dataChannel = e.channel;
+                bindChannelEvents();
+            };
+        }
+
+        // Caller side
+        async function initiateP2PConnection(target) {
+            initPeerObject(target);
+            dataChannel = localPeerConnection.createDataChannel("chat-payload");
+            bindChannelEvents();
+
+            const offer = await localPeerConnection.createOffer();
+            await localPeerConnection.setLocalDescription(offer);
+            wsServer.send(JSON.stringify({ type: 'relay', target: targetUsername, payload: { sdp: offer } }));
+        }
+
+        // Handle inbound connection signals
+        async function handleSignalingPayload(sender, payload) {
+            if (!localPeerConnection) initPeerObject(sender);
+
+            if (payload.sdp) {
+                await localPeerConnection.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+                if (payload.sdp.type === 'offer') {
+                    const answer = await localPeerConnection.createAnswer();
+                    await localPeerConnection.setLocalDescription(answer);
+                    wsServer.send(JSON.stringify({ type: 'relay', target: targetUsername, payload: { sdp: answer } }));
+                }
+            } else if (payload.candidate) {
+                await localPeerConnection.addIceCandidate(new RTCIceCandidate(payload.candidate));
+            }
+        }
+
+        function bindChannelEvents() {
+            dataChannel.onopen = () => {
+                log("🔒 E2EE Direct Tunnel open. Messages are completely secure.");
+                document.getElementById('msg-input').disabled = false;
+                document.getElementById('btn-send').disabled = false;
+            };
+            dataChannel.onmessage = async (e) => {
+                try {
+                    const msg = await decrypt(e.data);
+                    log(`<strong>${targetUsername}:</strong> ${msg}`);
+                } catch {
+                    log(`⚠️ Decryption failed from ${targetUsername}. Keys do not match.`);
+                }
+            };
+        }
+
+        // --- SEND INTERACTION ---
+        async function fireMessage() {
+            const input = document.getElementById('msg-input');
+            if (!input.value.trim()) return;
+            log(`<strong>You:</strong> ${input.value}`);
+            const encryptedRaw = await encrypt(input.value);
+            dataChannel.send(encryptedRaw);
+            input.value = "";
+        }
+
+        document.getElementById('btn-send').addEventListener('click', fireMessage);
+        document.getElementById('msg-input').addEventListener('keypress', (e) => { if(e.key === 'Enter') fireMessage(); });
+    </script>
+</body>
+</html>

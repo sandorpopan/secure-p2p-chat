@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Serverless E2EE P2P Chat</title>
+    <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 20px auto; padding: 0 10px; }
+        textarea { width: 100%; height: 80px; }
+        .box { border: 1px solid #ccc; padding: 10px; margin-bottom: 10px; border-radius: 4px; }
+        #chat-log { height: 200px; border: 1px solid #aaa; overflow-y: scroll; padding: 5px; background: #f9f9f9; }
+    </style>
+</head>
+<body>
+
+    <h2>Serverless Encrypted P2P Chat</h2>
+    <p>Open this file in two different tabs or devices.</p>
+
+    <div class="box">
+        <h3>Step 1: Set Shared Secret Key</h3>
+        <input type="text" id="secret-key" value="SuperSecretPassword123!" style="width: 100%;">
+        <small>Both peers must enter the exact same secret *before* generating or pasting signaling data.</small>
+    </div>
+
+    <div class="box">
+        <h3>Step 2: Connection Setup (Signaling)</h3>
+        <button id="btn-init">1. Create Local Offer</button>
+        <button id="btn-answer" disabled>3. Create Answer from Remote Offer</button>
+        <button id="btn-accept" disabled>5. Accept Final Answer</button>
+        
+        <p>Signaling Data Box:</p>
+        <textarea id="signaling-data" placeholder="Paste remote data here, or copy generated data from here..."></textarea>
+    </div>
+
+    <div class="box">
+        <h3>Step 3: Encrypted Chat</h3>
+        <div id="chat-log"></div>
+        <input type="text" id="msg-input" placeholder="Type a message..." style="width: 75%;" disabled>
+        <button id="btn-send" disabled>Send</button>
+    </div>
+
+    <script>
+        let localConnection;
+        let dataChannel;
+        let cryptoKey;
+
+        const secretInput = document.getElementById('secret-key');
+        const signalingBox = document.getElementById('signaling-data');
+        const chatLog = document.getElementById('chat-log');
+        const msgInput = document.getElementById('msg-input');
+        const btnSend = document.getElementById('btn-send');
+
+        // --- CRYPTOGRAPHY FUNCTIONS ---
+        // Derives a cryptographic AES-GCM key from the user-entered password
+        async function deriveKey(password) {
+            const enc = new TextEncoder();
+            const keyMaterial = await crypto.subtle.importKey(
+                "raw", enc.encode(password), { name: "PBKDF2" }, false, ["deriveBits", "deriveKey"]
+            );
+            // Using a static salt for simplicity in a serverless manual setup
+            const salt = enc.encode("StaticSaltForP2PServerless"); 
+            return crypto.subtle.deriveKey(
+                { name: "PBKDF2", salt: salt, iterations: 100000, hash: "SHA-256" },
+                keyMaterial,
+                { name: "AES-GCM", length: 256 },
+                false,
+                ["encrypt", "decrypt"]
+            );
+        }
+
+        async function encryptMessage(text) {
+            const key = await deriveKey(secretInput.value);
+            const enc = new TextEncoder();
+            const iv = crypto.getRandomValues(new Uint8Array(12)); // 96-bit IV
+            const encrypted = await crypto.subtle.encrypt(
+                { name: "AES-GCM", iv: iv }, key, enc.encode(text)
+            );
+            
+            // Combine IV and Ciphertext into one payload to transmit
+            const payload = new Uint8Array(iv.byteLength + encrypted.byteLength);
+            payload.set(iv, 0);
+            payload.set(new Uint8Array(encrypted), iv.byteLength);
+            return payload;
+        }
+
+        async function decryptMessage(combinedBuffer) {
+            const key = await deriveKey(secretInput.value);
+            const dec = new TextDecoder();
+            const payload = new Uint8Array(combinedBuffer);
+            
+            const iv = payload.slice(0, 12);
+            const ciphertext = payload.slice(12);
+            
+            const decrypted = await crypto.subtle.decrypt(
+                { name: "AES-GCM", iv: iv }, key, ciphertext
+            );
+            return dec.decode(decrypted);
+        }
+
+        // --- P2P CONNECTION HANDLERS ---
+        function createPeerConnection() {
+            // Free public STUN servers so peers can discover their public IPs
+            const config = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+            localConnection = new RTCPeerConnection(config);
+
+            localConnection.onicecandidate = (e) => {
+                // When gathering is done, display the configuration string for the user to copy
+                if (!e.candidate) {
+                    signalingBox.value = btoa(JSON.stringify(localConnection.localDescription));
+                    log("Signaling configuration generated! Copy the text in the box above.");
+                }
+            };
+        }
+
+        // Alice Setup (Initiator)
+        document.getElementById('btn-init').addEventListener('click', () => {
+            createPeerConnection();
+            dataChannel = localConnection.createDataChannel("chat");
+            setupDataChannelHandlers();
+
+            localConnection.createOffer()
+                .then(offer => localConnection.setLocalDescription(offer));
+            
+            document.getElementById('btn-accept').disabled = false;
+        });
+
+        // Bob Setup (Receiver)
+        signalingBox.addEventListener('input', () => {
+            if(signalingBox.value.length > 50 && !localConnection) {
+                document.getElementById('btn-answer').disabled = false;
+            }
+        });
+
+        document.getElementById('btn-answer').addEventListener('click', async () => {
+            createPeerConnection();
+            localConnection.ondatachannel = (e) => {
+                dataChannel = e.channel;
+                setupDataChannelHandlers();
+            };
+
+            const remoteOffer = JSON.parse(atob(signalingBox.value));
+            await localConnection.setRemoteDescription(remoteOffer);
+            const answer = await localConnection.createAnswer();
+            await localConnection.setLocalDescription(answer);
+        });
+
+        // Alice Finishing Setup
+        document.getElementById('btn-accept').addEventListener('click', async () => {
+            const remoteAnswer = JSON.parse(atob(signalingBox.value));
+            await localConnection.setRemoteDescription(remoteAnswer);
+        });
+
+        function setupDataChannelHandlers() {
+            dataChannel.onopen = () => {
+                log("🔒 P2P Tunnel Established! Chat is now end-to-end encrypted.");
+                msgInput.disabled = false;
+                btnSend.disabled = false;
+            };
+            dataChannel.onmessage = async (e) => {
+                try {
+                    const decrypted = await decryptMessage(e.data);
+                    log("Peer: " + decrypted);
+                } catch (err) {
+                    log("⚠️ Received a message but failed to decrypt it. Check if your shared secrets match!");
+                }
+            };
+        }
+
+        // --- UI & SENDING ---
+        async function sendMessage() {
+            const text = msgInput.value;
+            if(!text) return;
+            
+            log("You: " + text);
+            const encryptedPayload = await encryptMessage(text);
+            dataChannel.send(encryptedPayload);
+            msgInput.value = '';
+        }
+
+        btnSend.addEventListener('click', sendMessage);
+        msgInput.addEventListener('keypress', (e) => { if(e.key === 'Enter') sendMessage(); });
+
+        function log(msg) {
+            chatLog.innerHTML += `<div>${msg}</div>`;
+            chatLog.scrollTop = chatLog.scrollHeight;
+        }
+    </script>
+</body>
+</html>
